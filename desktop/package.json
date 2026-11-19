@@ -1,0 +1,62 @@
+{
+  "name": "dark-web-deanonymization-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Desktop application for the Dark Web Threat Actor De-anonymization Toolkit (SIH 2026, PS #151)",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build:backend": "cd .. && pyinstaller desktop/backend.spec --distpath desktop/dist --workpath desktop/build --noconfirm",
+    "build:frontend": "cd ../frontend && npm install && npm run build",
+    "build:all": "npm run build:backend && npm run build:frontend",
+    "dist:win": "npm run build:all && electron-builder --win",
+    "dist:mac": "npm run build:all && electron-builder --mac",
+    "dist:linux": "npm run build:all && electron-builder --linux",
+    "dist:dir": "npm run build:all && electron-builder --dir"
+  },
+  "devDependencies": {
+    "electron": "^31.3.1",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "in.gov.sih2026.darkwebdeanonymization",
+    "productName": "DarkWeb Identity Correlation Toolkit",
+    "copyright": "Copyright © 2026",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "splash.html",
+      "icons/**/*"
+    ],
+    "extraResources": [
+      { "from": "dist/dwta-backend", "to": "backend" },
+      { "from": "../frontend/dist", "to": "frontend" }
+    ],
+    "win": {
+      "target": [{ "target": "nsis", "arch": ["x64"] }],
+      "icon": "icons/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    },
+    "mac": {
+      "target": [{ "target": "dmg", "arch": ["x64", "arm64"] }],
+      "icon": "icons/icon.icns",
+      "category": "public.app-category.developer-tools",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false
+    },
+    "linux": {
+      "target": [{ "target": "AppImage", "arch": ["x64"] }],
+      "icon": "icons/icon.png",
+      "category": "Utility"
+    }
+  }
+}

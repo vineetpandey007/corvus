@@ -1,0 +1,41 @@
+# ============================================================
+# Central configuration for the toolkit.
+# Values here can be overridden by environment variables in .env
+# ============================================================
+
+app:
+  name: "Dark Web Threat Actor De-anonymization Toolkit"
+  version: "0.1.0"
+  log_level: "INFO"
+  frontend_base_url: "http://localhost:5173"   # used to build password-reset links; update for your deployed frontend URL
+
+graph:
+  backend: "networkx"       # "networkx" (in-memory, default) or "neo4j" (persistent — requires Neo4j creds in .env)
+
+stylometry:
+  similarity_threshold: 0.75   # score above which two aliases are flagged as a likely match
+  min_text_length_chars: 200   # ignore posts shorter than this (too little signal)
+
+username:
+  enabled: true
+  similarity_threshold: 0.82    # Levenshtein ratio (0-1) above which two handles are flagged as related
+  max_confidence: 0.55           # capped below stylometry/PGP/wallet since handle similarity alone is weak evidence
+
+security:
+  rate_limit_per_minute: 60          # per-IP request limit on the API (via slowapi)
+  access_token_expire_minutes: 60    # JWT session length
+
+pgp:
+  require_full_fingerprint_match: true
+
+blockchain:
+  supported_chains: ["ethereum", "bitcoin"]
+  request_cache_ttl_seconds: 3600
+
+ingestion:
+  rate_limit_seconds_between_requests: 5   # be a good citizen / avoid detection & overload
+  tor_proxy: "socks5h://127.0.0.1:9050"    # only used if a real collector is configured
+
+audit:
+  enabled: true
+  log_path: "audit_log.jsonl"   # filename only — resolved inside the app-data directory (see src/utils/config.py::get_app_data_dir)

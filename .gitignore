@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment / secrets
+.env
+
+# Collected/processed data (never commit real case data)
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# Node / frontend
+frontend/node_modules/
+frontend/build/
+frontend/.env
+
+# Desktop app (Electron + PyInstaller build artifacts — regenerate via
+# desktop/README.md, never commit these; dist/build/release routinely
+# total 500MB-1GB+)
+desktop/node_modules/
+desktop/dist/
+desktop/build/
+desktop/release/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.log
+
+# Neo4j local docker volume (if used)
+neo4j-data/
+
+# Local DB / Vite dist / helpers
+frontend/dist/
+*.db
+*.sqlite*
+S.bat

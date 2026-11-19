@@ -1,0 +1,77 @@
+# ============================================================
+# Dark Web Threat Actor De-anonymization Toolkit
+# requirements.txt — all packages are open source (MIT/BSD/Apache-2.0)
+# Install with: pip install -r requirements.txt --break-system-packages
+# ============================================================
+
+# --- Web API / backend ---
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+pydantic>=2.6.0
+python-multipart>=0.0.9
+python-dotenv>=1.0.1
+PyYAML>=6.0.1
+
+# --- HTTP / networking / legally-scoped OSINT collection ---
+requests>=2.31.0
+beautifulsoup4>=4.12.3
+lxml>=5.1.0
+stem>=1.8.2                # Tor controller library (for routing legally authorized
+                            # collection through the Tor SOCKS proxy — does NOT
+                            # break Tor's anonymity)
+PySocks>=1.7.1              # SOCKS proxy support for requests -> Tor
+
+# --- Data handling ---
+numpy>=1.26.4
+
+# --- NLP / stylometry ---
+spacy>=3.7.4
+scikit-learn>=1.4.1.post1
+
+# --- Identity graph / correlation ---
+networkx>=3.2.1
+neo4j>=5.18.0                # graph-DB driver (Bolt protocol) — persistent backend
+python-gnupg>=0.5.2          # parsing/inspecting PGP key metadata
+rapidfuzz>=3.6.2              # fast Levenshtein-based username fuzzy matching
+jellyfish>=1.0.3               # phonetic matching (Soundex/Metaphone) for usernames
+
+# --- Blockchain tracing (public on-chain data only, via plain HTTP requests
+#     to Etherscan / Blockstream Esplora — no web3.py needed) ---
+requests-cache>=1.2.0        # cache public block-explorer API calls
+
+# --- Persistence (users, cases, audit trail) ---
+SQLAlchemy>=2.0.28
+alembic>=1.13.1                # DB migrations
+
+# --- Auth ---
+python-jose[cryptography]>=3.3.0   # JWT issuing/verification
+bcrypt>=4.1.2                        # password hashing (used directly — avoids a known
+                                      # passlib/bcrypt version-detection incompatibility)
+
+# --- Resilience ---
+tenacity>=8.2.3                 # retry/backoff on flaky external API calls
+slowapi>=0.1.9                   # rate limiting middleware for FastAPI
+
+# --- Security / encryption at rest ---
+cryptography>=42.0.5
+
+# --- Reporting / export ---
+reportlab>=4.1.0             # PDF report generation (pure-Python, no system deps)
+
+# --- Visualization (used by scripts/run_pipeline.py's PNG/JSON graph
+#     export — not required by the API process itself, so it's explicitly
+#     excluded from the desktop PyInstaller bundle; see desktop/backend.spec) ---
+matplotlib>=3.8.3
+
+# --- Logging / config ---
+loguru>=0.7.2
+
+# --- Testing / dev tooling ---
+pytest>=8.1.1
+pytest-cov>=4.1.0
+httpx>=0.27.0                # test client for FastAPI
+black>=24.2.0
+flake8>=7.0.0
+
+# --- After installing, also run: ---
+# python -m spacy download en_core_web_sm
