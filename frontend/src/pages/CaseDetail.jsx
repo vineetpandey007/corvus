@@ -5,6 +5,52 @@ import GraphView from "../components/GraphView";
 
 const EMPTY_POST = { alias: "", source: "", text: "" };
 
+function formatApiError(err, fallback) {
+  const detail = err?.response?.data?.detail;
+  if (!detail) return fallback;
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    return detail
+      .map((item) => {
+        const loc = Array.isArray(item.loc) ? item.loc.slice(1).join(".") : "";
+        return loc ? `${loc}: ${item.msg}` : item.msg || JSON.stringify(item);
+      })
+      .join(" | ");
+  }
+  return typeof detail === "object" ? JSON.stringify(detail) : String(detail);
+}
+
+function renderEvidenceSummary(edge) {
+  const ev = edge.evidence || {};
+  const parts = [];
+
+  if (ev.wallet_reuse?.shared_addresses?.length) {
+    parts.push(`Wallet: ${ev.wallet_reuse.shared_addresses.join(", ")}`);
+  }
+  if (ev.pgp_key_reuse?.shared_fingerprints?.length) {
+    parts.push(`PGP FP: ${ev.pgp_key_reuse.shared_fingerprints.join(", ")}`);
+  } else if (ev.pgp_key_reuse?.shared_user_ids?.length) {
+    parts.push(`PGP UID: ${ev.pgp_key_reuse.shared_user_ids.join(", ")}`);
+  }
+  if (ev.stylometry?.breakdown) {
+    const b = ev.stylometry.breakdown;
+    parts.push(
+      `Style (char ${(b.char_ngram_similarity * 100).toFixed(0)}%, fw ${(
+        b.function_word_similarity * 100
+      ).toFixed(0)}%, pos ${(b.pos_similarity * 100).toFixed(0)}%)`
+    );
+  }
+  if (ev.username_similarity) {
+    parts.push(
+      `Handle (lev ${(ev.username_similarity.levenshtein_score * 100).toFixed(0)}%${
+        ev.username_similarity.phonetic_match ? ", phonetic" : ""
+      })`
+    );
+  }
+
+  return parts.length > 0 ? parts.join(" • ") : "Probabilistic signal match";
+}
+
 export default function CaseDetail() {
   const { caseId } = useParams();
   const [graph, setGraph] = useState(null);
@@ -18,72 +64,141 @@ export default function CaseDetail() {
   const [error, setError] = useState("");
   const [activeTab, setActiveTab] = useState("graph");
   const [queryInput, setQueryInput] = useState("");
-  const [queryHistory, setQueryHistory] = useState([]); // [{query, answer, followUps}]
+  const [queryHistory, setQueryHistory] = useState([]);
   const [queryLoading, setQueryLoading] = useState(false);
   const [suggestions, setSuggestions] = useState(null);
   const [suggestionsLoading, setSuggestionsLoading] = useState(false);
+  const [auditStatus, setAuditStatus] = useState(null);
+  const [verifyingAudit, setVerifyingAudit] = useState(false);
 
-  async function loadCaseData() {
+  async function loadCaseData(signal = { cancelled: false }) {
     setLoading(true);
     try {
       const [graphResp, postsResp] = await Promise.all([
         casesApi.getGraph(caseId),
         casesApi.getPosts(caseId),
       ]);
-      setGraph(graphResp.data);
-      setPosts(postsResp.data);
+      if (!signal.cancelled) {
+        setGraph(graphResp.data);
+        setPosts(postsResp.data);
+      }
     } catch (err) {
-      setError("Could not load case data.");
+      if (!signal.cancelled) {
+        setError(formatApiError(err, "Could not load case data."));
+      }
     } finally {
-      setLoading(false);
+      if (!signal.cancelled) {
+        setLoading(false);
+      }
     }
   }
 
+  // Reset all case-scoped state when switching between cases
   useEffect(() => {
-    loadCaseData();
+    const signal = { cancelled: false };
+    setGraph(null);
+    setPosts([]);
+    setReport(null);
+    setSuggestions(null);
+    setQueryHistory([]);
+    setDraftPosts([{ ...EMPTY_POST }]);
+    setAuditStatus(null);
+    setError("");
+    loadCaseData(signal);
+    return () => {
+      signal.cancelled = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [caseId]);
 
-  // Report is fetched lazily (only once, the first time that tab is opened)
-  // rather than on every page load — it's a derived view, not core case
-  // state, and re-fetching on every ingest would be wasted work.
   useEffect(() => {
+    let cancelled = false;
     if (activeTab === "report" && !report && !reportLoading) {
       setReportLoading(true);
       reportsApi
         .getReport(caseId)
-        .then((resp) => setReport(resp.data))
-        .catch(() => setError("Could not load report."))
-        .finally(() => setReportLoading(false));
+        .then((resp) => {
+          if (!cancelled) setReport(resp.data);
+        })
+        .catch((err) => {
+          if (!cancelled) setError(formatApiError(err, "Could not load report."));
+        })
+        .finally(() => {
+          if (!cancelled) setReportLoading(false);
+        });
     }
+    return () => {
+      cancelled = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTab]);
+  }, [activeTab, caseId]);
 
   useEffect(() => {
+    let cancelled = false;
     if (activeTab === "insights" && !suggestions && !suggestionsLoading) {
       setSuggestionsLoading(true);
       nlpApi
         .getSuggestions(caseId)
-        .then((resp) => setSuggestions(resp.data.suggestions))
-        .catch(() => setError("Could not load suggestions."))
-        .finally(() => setSuggestionsLoading(false));
+        .then((resp) => {
+          if (!cancelled) setSuggestions(resp.data.suggestions);
+        })
+        .catch((err) => {
+          if (!cancelled) setError(formatApiError(err, "Could not load suggestions."));
+        })
+        .finally(() => {
+          if (!cancelled) setSuggestionsLoading(false);
+        });
     }
+    return () => {
+      cancelled = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTab]);
+  }, [activeTab, caseId]);
+
+  async function handleVerifyAudit() {
+    setVerifyingAudit(true);
+    setError("");
+    try {
+      if (typeof casesApi.verifyAudit === "function") {
+        const resp = await casesApi.verifyAudit(caseId);
+        setAuditStatus(resp.data);
+      } else {
+        const apiBase =
+          window.corvusDesktop?.backendUrl ||
+          import.meta.env.VITE_API_URL ||
+          "http://localhost:8000";
+        const token = localStorage.getItem("token") || localStorage.getItem("access_token");
+        const resp = await fetch(`${apiBase}/cases/${caseId}/audit-verify`, {
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        });
+        if (!resp.ok) throw new Error("Audit verification failed");
+        setAuditStatus(await resp.json());
+      }
+    } catch (err) {
+      setError(formatApiError(err, "Could not verify audit log integrity."));
+    } finally {
+      setVerifyingAudit(false);
+    }
+  }
 
   async function runQuery(text) {
     const trimmed = text.trim();
     if (!trimmed) return;
     setQueryLoading(true);
+    setError("");
     try {
       const resp = await nlpApi.query(caseId, trimmed);
       setQueryHistory((prev) => [
         ...prev,
-        { query: trimmed, answer: resp.data.answer, followUps: resp.data.follow_up_questions || [] },
+        {
+          query: trimmed,
+          answer: resp.data.answer,
+          followUps: resp.data.follow_up_questions || [],
+        },
       ]);
       setQueryInput("");
-    } catch {
-      setError("Query failed.");
+    } catch (err) {
+      setError(formatApiError(err, "Query failed."));
     } finally {
       setQueryLoading(false);
     }
@@ -96,7 +211,7 @@ export default function CaseDetail() {
       if (format === "txt") await reportsApi.downloadTxt(caseId);
       else await reportsApi.downloadPdf(caseId);
     } catch (err) {
-      setError(`Export to ${format.toUpperCase()} failed.`);
+      setError(formatApiError(err, `Export to ${format.toUpperCase()} failed.`));
     } finally {
       setExporting(null);
     }
@@ -118,22 +233,37 @@ export default function CaseDetail() {
 
   async function handleIngest(e) {
     e.preventDefault();
-    setIngesting(true);
     setError("");
+    const validPosts = draftPosts
+      .map((p) => ({
+        alias: p.alias.trim(),
+        source: p.source.trim(),
+        text: p.text.trim(),
+      }))
+      .filter((p) => p.alias && p.text);
+
+    if (validPosts.length === 0) {
+      setError("Enter at least one post with a non-empty alias and text.");
+      return;
+    }
+
+    setIngesting(true);
     try {
-      const validPosts = draftPosts.filter((p) => p.alias && p.text);
       await casesApi.ingest(caseId, validPosts);
       setDraftPosts([{ ...EMPTY_POST }]);
-      setReport(null); // stale after a new ingest — refetched next time the Report tab opens
-      setSuggestions(null); // same — refetched next time the Insights tab opens
+      setReport(null);
+      setSuggestions(null);
+      setAuditStatus(null);
       await loadCaseData();
       setActiveTab("graph");
     } catch (err) {
-      setError(err.response?.data?.detail || "Ingest failed.");
+      setError(formatApiError(err, "Ingest failed."));
     } finally {
       setIngesting(false);
     }
   }
+
+  const edges = graph?.edges || [];
 
   return (
     <div className="page">
@@ -143,6 +273,29 @@ export default function CaseDetail() {
             ← All cases
           </Link>
           <h1>Case #{caseId}</h1>
+        </div>
+        <div style={{ display: "flex", gap: "0.75rem", alignItems: "center" }}>
+          {auditStatus && (
+            <span
+              className="muted"
+              style={{
+                fontSize: "0.85rem",
+                color: auditStatus.valid ? "#4ade80" : "#f87171",
+              }}
+            >
+              {auditStatus.valid
+                ? `Audit Chain Verified (${auditStatus.entries} entries)`
+                : `Audit Chain Broken at line ${auditStatus.broken_at_line}`}
+            </span>
+          )}
+          <button
+            type="button"
+            className="secondary"
+            onClick={handleVerifyAudit}
+            disabled={verifyingAudit}
+          >
+            {verifyingAudit ? "Verifying…" : "Verify Audit Chain"}
+          </button>
         </div>
       </header>
 
@@ -188,6 +341,34 @@ export default function CaseDetail() {
           {activeTab === "graph" && (
             <section className="card">
               <GraphView graph={graph} />
+
+              {edges.length > 0 && (
+                <div style={{ marginTop: "1.5rem" }}>
+                  <h3>Forensic Correlation Breakdown</h3>
+                  <table className="posts-table">
+                    <thead>
+                      <tr>
+                        <th>Alias Pair</th>
+                        <th>Signals</th>
+                        <th>Confidence</th>
+                        <th>Underlying Evidence</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {edges.map((edge, idx) => (
+                        <tr key={`${edge.source}-${edge.target}-${idx}`}>
+                          <td>
+                            <strong>{edge.source}</strong> ↔ <strong>{edge.target}</strong>
+                          </td>
+                          <td>{(edge.types || []).join(", ")}</td>
+                          <td>{Math.round((edge.confidence || 0) * 100)}%</td>
+                          <td className="post-text-cell">{renderEvidenceSummary(edge)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
             </section>
           )}
 
@@ -197,7 +378,8 @@ export default function CaseDetail() {
               <p className="muted">
                 Add lawfully collected posts/aliases to run through the
                 correlation pipeline (stylometry, PGP key reuse, wallet
-                reuse, username similarity). Text is encrypted at rest.
+                reuse, username similarity). Text is encrypted at rest and
+                hashed (SHA-256) on ingestion.
               </p>
               <form onSubmit={handleIngest}>
                 {draftPosts.map((post, idx) => (
@@ -245,7 +427,7 @@ export default function CaseDetail() {
 
           {activeTab === "posts" && (
             <section className="card">
-              <h2>Stored Posts (decrypted for review)</h2>
+              <h2>Stored Evidence Posts (decrypted for review)</h2>
               {posts.length === 0 ? (
                 <p className="muted">No posts ingested yet.</p>
               ) : (
@@ -255,15 +437,22 @@ export default function CaseDetail() {
                       <th>Alias</th>
                       <th>Source</th>
                       <th>Text</th>
+                      <th>SHA-256 Digest</th>
                       <th>Ingested</th>
                     </tr>
                   </thead>
                   <tbody>
                     {posts.map((p, idx) => (
-                      <tr key={idx}>
+                      <tr key={p.id || idx}>
                         <td>{p.alias}</td>
                         <td>{p.source}</td>
                         <td className="post-text-cell">{p.text}</td>
+                        <td
+                          title={p.evidence_sha256 || ""}
+                          style={{ fontFamily: "monospace", fontSize: "0.8rem" }}
+                        >
+                          {p.evidence_sha256 ? `${p.evidence_sha256.slice(0, 16)}…` : "—"}
+                        </td>
                         <td>{new Date(p.created_at).toLocaleString()}</td>
                       </tr>
                     ))}

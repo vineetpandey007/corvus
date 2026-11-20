@@ -1,36 +1,63 @@
 /**
- * Electron main process.
+ * Electron main process — hardened desktop shell for Corvus.
  *
- * Responsibilities, in order:
- *   1. Show a splash screen immediately (backend cold-start, especially
- *      spaCy's model load, can take a few seconds — an instant window
- *      beats a few seconds of nothing).
- *   2. Spawn the bundled PyInstaller backend executable, pointed at a
- *      per-OS user-data directory via APP_DATA_DIR (see
- *      desktop/backend_entry.py — this is what triggers first-run secret
- *      generation and routes the SQLite DB there instead of into the
- *      installed app's own directory, which may not be writable).
- *   3. Poll /health until the backend responds, then swap the splash
- *      screen for the real app window loading the built React dashboard.
- *   4. On quit, kill the backend child process — it must never be left
- *      running orphaned after the app closes.
+ * Security & reliability invariants:
+ *   1. Single-instance lock (prevents concurrent SQLite lock contention).
+ *   2. Ephemeral 127.0.0.1 port allocation (eliminates port 8000 collisions).
+ *   3. Full process-tree cleanup on exit (prevents Windows PyInstaller orphans).
+ *   4. Strict navigation & window-open lockdown (contextIsolation + sandbox).
  */
 
-const { app, BrowserWindow, dialog } = require("electron");
+const { app, BrowserWindow, dialog, shell } = require("electron");
 const path = require("path");
 const fs = require("fs");
 const http = require("http");
-const { spawn } = require("child_process");
+const net = require("net");
+const { spawn, execFileSync } = require("child_process");
 
 const isDev = !app.isPackaged;
-const BACKEND_PORT = process.env.DWTA_BACKEND_PORT || "8000";
 const BACKEND_HOST = "127.0.0.1";
-const HEALTH_URL = `http://${BACKEND_HOST}:${BACKEND_PORT}/health`;
-const STARTUP_TIMEOUT_MS = 45000; // generous — first run on a slow disk can be slow to cold-start
+const STARTUP_TIMEOUT_MS = 45000;
 
 let backendProcess = null;
+let backendLogStream = null;
+let resolvedBackendPort = null;
 let mainWindow = null;
 let splashWindow = null;
+
+// Prevent multiple instances from fighting over the local SQLite database
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on("second-instance", () => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+    }
+  });
+}
+
+function findAvailablePort(preferredPort) {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.unref();
+    server.on("error", () => {
+      // Preferred port is occupied; fall back to OS-assigned ephemeral port
+      const fallback = net.createServer();
+      fallback.unref();
+      fallback.on("error", reject);
+      fallback.listen(0, BACKEND_HOST, () => {
+        const { port } = fallback.address();
+        fallback.close(() => resolve(String(port)));
+      });
+    });
+    server.listen(Number(preferredPort) || 0, BACKEND_HOST, () => {
+      const { port } = server.address();
+      server.close(() => resolve(String(port)));
+    });
+  });
+}
 
 function getBackendExecutablePath() {
   const exeName = process.platform === "win32" ? "dwta-backend.exe" : "dwta-backend";
@@ -46,12 +73,14 @@ function getFrontendIndexPath() {
     : path.join(process.resourcesPath, "frontend", "index.html");
 }
 
-function waitForBackendHealth(timeoutMs) {
+function waitForBackendHealth(port, timeoutMs) {
   const startedAt = Date.now();
+  const healthUrl = `http://${BACKEND_HOST}:${port}/health`;
+
   return new Promise((resolve, reject) => {
     const attempt = () => {
-      const req = http.get(HEALTH_URL, { timeout: 2000 }, (res) => {
-        res.resume(); // drain
+      const req = http.get(healthUrl, { timeout: 2000 }, (res) => {
+        res.resume();
         if (res.statusCode === 200) {
           resolve();
         } else {
@@ -75,7 +104,7 @@ function waitForBackendHealth(timeoutMs) {
   });
 }
 
-function startBackend() {
+function startBackend(port) {
   const exePath = getBackendExecutablePath();
 
   if (!fs.existsSync(exePath)) {
@@ -88,40 +117,57 @@ function startBackend() {
   }
 
   const appDataDir = app.getPath("userData");
+  const logPath = path.join(appDataDir, "backend-process.log");
+  backendLogStream = fs.createWriteStream(logPath, { flags: "a" });
 
   backendProcess = spawn(exePath, [], {
     env: {
       ...process.env,
       APP_DATA_DIR: appDataDir,
       HOST: BACKEND_HOST,
-      PORT: BACKEND_PORT,
+      PORT: port,
     },
-    // In dev, pipe the backend's own logs straight to this process's
-    // console — invaluable while iterating. In a packaged build, still
-    // capture them (rather than discarding) so a support request can ask
-    // for the log file below instead of asking the user to run from a
-    // terminal.
     stdio: ["ignore", "pipe", "pipe"],
   });
 
-  const logPath = path.join(appDataDir, "backend-process.log");
-  const logStream = fs.createWriteStream(logPath, { flags: "a" });
-  backendProcess.stdout.pipe(logStream);
-  backendProcess.stderr.pipe(logStream);
+  backendProcess.stdout.pipe(backendLogStream);
+  backendProcess.stderr.pipe(backendLogStream);
   if (isDev) {
     backendProcess.stdout.pipe(process.stdout);
     backendProcess.stderr.pipe(process.stderr);
   }
 
   backendProcess.on("error", (err) => {
-    dialog.showErrorBox("Backend failed to start", String(err));
+    dialog.showErrorBox("Corvus Backend Error", String(err));
   });
 
   backendProcess.on("exit", (code, signal) => {
     if (code !== 0 && code !== null) {
       console.error(`Backend process exited unexpectedly (code=${code}, signal=${signal})`);
     }
+    backendProcess = null;
   });
+}
+
+function stopBackend() {
+  if (!backendProcess || !backendProcess.pid) return;
+  const pid = backendProcess.pid;
+  try {
+    if (process.platform === "win32") {
+      // Terminate PyInstaller bootloader + child uvicorn worker tree cleanly
+      execFileSync("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore" });
+    } else {
+      backendProcess.kill("SIGTERM");
+    }
+  } catch {
+    // Process already exited
+  } finally {
+    backendProcess = null;
+    if (backendLogStream) {
+      backendLogStream.end();
+      backendLogStream = null;
+    }
+  }
 }
 
 function createSplashWindow() {
@@ -132,12 +178,18 @@ function createSplashWindow() {
     resizable: false,
     center: true,
     backgroundColor: "#0f1115",
-    webPreferences: { contextIsolation: true },
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
   });
   splashWindow.loadFile(path.join(__dirname, "splash.html"));
 }
 
-function createMainWindow() {
+function createMainWindow(port) {
+  const indexPath = getFrontendIndexPath();
+
   mainWindow = new BrowserWindow({
     width: 1320,
     height: 860,
@@ -147,28 +199,48 @@ function createMainWindow() {
     icon: path.join(__dirname, "icons", "icon.png"),
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
+      additionalArguments: [`--backend-port=${port}`],
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
     },
   });
 
-  mainWindow.loadFile(getFrontendIndexPath());
+  // Prevent untrusted links inside ingested posts from navigating the Electron shell
+  mainWindow.webContents.on("will-navigate", (event, targetUrl) => {
+    if (!targetUrl.startsWith("file://")) {
+      event.preventDefault();
+    }
+  });
+
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (url.startsWith("https://") || url.startsWith("http://")) {
+      shell.openExternal(url);
+    }
+    return { action: "deny" };
+  });
+
+  mainWindow.loadFile(indexPath);
   mainWindow.on("closed", () => {
     mainWindow = null;
   });
 }
 
 async function boot() {
+  if (!gotSingleInstanceLock) return;
   createSplashWindow();
 
   try {
-    startBackend();
-    await waitForBackendHealth(STARTUP_TIMEOUT_MS);
+    const preferredPort =
+      process.env.CORVUS_BACKEND_PORT || process.env.DWTA_BACKEND_PORT || "8000";
+    resolvedBackendPort = await findAvailablePort(preferredPort);
+    startBackend(resolvedBackendPort);
+    await waitForBackendHealth(resolvedBackendPort, STARTUP_TIMEOUT_MS);
   } catch (err) {
+    stopBackend();
     if (splashWindow) splashWindow.close();
     dialog.showErrorBox(
-      "Startup failed",
+      "Corvus Startup Failed",
       `The local backend service did not start correctly.\n\n${err.message}\n\n` +
         `Log file: ${path.join(app.getPath("userData"), "backend-process.log")}`
     );
@@ -180,7 +252,7 @@ async function boot() {
     splashWindow.close();
     splashWindow = null;
   }
-  createMainWindow();
+  createMainWindow(resolvedBackendPort);
 }
 
 app.whenReady().then(boot);
@@ -192,13 +264,11 @@ app.on("window-all-closed", () => {
 });
 
 app.on("before-quit", () => {
-  if (backendProcess && !backendProcess.killed) {
-    backendProcess.kill();
-  }
+  stopBackend();
 });
 
 app.on("activate", () => {
-  if (BrowserWindow.getAllWindows().length === 0) {
-    createMainWindow();
+  if (BrowserWindow.getAllWindows().length === 0 && resolvedBackendPort) {
+    createMainWindow(resolvedBackendPort);
   }
 });

@@ -1,16 +1,19 @@
 /**
  * Preload script — runs in an isolated context before the renderer loads.
- *
- * Currently exposes nothing: the React dashboard talks to the backend
- * over plain HTTP (via axios, see frontend/src/api/client.js), not
- * through Electron IPC, so there's no privileged API surface the
- * renderer needs. This file exists so contextIsolation can stay enabled
- * (Electron security best practice) rather than being skipped.
- *
- * If a future feature needs real OS integration (native file save
- * dialogs, system notifications, etc.), expose it here explicitly via
- * contextBridge.exposeInMainWorld — never re-enable nodeIntegration in
- * the renderer as a shortcut.
+ * Exposes only read-only runtime configuration via contextBridge so
+ * contextIsolation and sandbox remain strictly enforced.
  */
 
-// Intentionally empty for now.
+const { contextBridge } = require("electron");
+
+const backendPortArg = process.argv.find((arg) => arg.startsWith("--backend-port="));
+const backendPort = backendPortArg ? backendPortArg.split("=")[1] : "8000";
+
+contextBridge.exposeInMainWorld(
+  "corvusDesktop",
+  Object.freeze({
+    isDesktop: true,
+    platform: process.platform,
+    backendUrl: `http://127.0.0.1:${backendPort}`,
+  })
+);
