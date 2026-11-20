@@ -1,27 +1,21 @@
 """
-Authentication: password hashing (bcrypt, called directly), JWT issuing/
-verification (python-jose), and FastAPI dependencies to protect routes.
-
-Two ways to authenticate against the API:
-1. JWT bearer token — obtained via POST /auth/login, used by the frontend
-   dashboard for analyst sessions.
-2. Static API key (X-API-Key header) — for service-to-service/automation
-   use. Configure via API_SERVICE_KEY in .env.
-
-Analysts are stored in the `users` table (src/db/models.py) with bcrypt-
-hashed passwords — plaintext passwords are never stored or logged.
+Authentication primitives: bcrypt password hashing, JWT issuing/verification
+with standard claims (sub, role, iat, exp, jti), constant-time API key
+validation, and secure token/OTP helpers.
 """
 
 import hashlib
+import hmac
 import os
 import secrets as pysecrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import Depends, HTTPException, status, Header
+import bcrypt
+from fastapi import Depends, Header, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
-import bcrypt
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from src.db.database import get_db
@@ -36,22 +30,24 @@ PASSWORD_RESET_TOKEN_EXPIRE_MINUTES = 30
 OTP_CODE_EXPIRE_MINUTES = 10
 OTP_MAX_ATTEMPTS = 5
 
+# Pre-computed dummy hash so non-existent user logins incur equivalent bcrypt CPU work
+_DUMMY_BCRYPT_HASH = bcrypt.hashpw(b"corvus-constant-time-dummy", bcrypt.gensalt()).decode("utf-8")
+
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=False)
 
 
-def _require_secret_key():
-    if not SECRET_KEY:
+def _get_secret_key() -> str:
+    key = os.environ.get("JWT_SECRET_KEY") or SECRET_KEY
+    if not key:
         raise RuntimeError(
             "JWT_SECRET_KEY is not set. Generate one with "
             "`python -c \"import secrets; print(secrets.token_urlsafe(32))\"` "
             "and add it to your .env file."
         )
+    return key
 
 
 def hash_password(password: str) -> str:
-    # bcrypt has a hard 72-byte input limit — truncate defensively so a very
-    # long passphrase doesn't raise instead of just being capped, matching
-    # common bcrypt-based auth implementations.
     pw_bytes = password.encode("utf-8")[:72]
     return bcrypt.hashpw(pw_bytes, bcrypt.gensalt()).decode("utf-8")
 
@@ -61,17 +57,34 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     return bcrypt.checkpw(pw_bytes, hashed_password.encode("utf-8"))
 
 
+def verify_password_constant_time(plain_password: str, hashed_password: Optional[str]) -> bool:
+    """
+    Run bcrypt verification even when `hashed_password` is None (unknown user)
+    to prevent account enumeration via response-latency timing attacks.
+    """
+    target_hash = hashed_password or _DUMMY_BCRYPT_HASH
+    valid = verify_password(plain_password, target_hash)
+    return bool(hashed_password) and valid
+
+
 def create_access_token(subject: str, role: str) -> str:
-    _require_secret_key()
-    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    payload = {"sub": subject, "role": role, "exp": expire}
-    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+    secret = _get_secret_key()
+    now = datetime.now(timezone.utc)
+    expire = now + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    payload = {
+        "sub": subject,
+        "role": role,
+        "iat": int(now.timestamp()),
+        "exp": expire,
+        "jti": pysecrets.token_hex(16),
+    }
+    return jwt.encode(payload, secret, algorithm=ALGORITHM)
 
 
 def decode_access_token(token: str) -> dict:
-    _require_secret_key()
+    secret = _get_secret_key()
     try:
-        return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return jwt.decode(token, secret, algorithms=[ALGORITHM])
     except JWTError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -85,13 +98,9 @@ def get_current_user(
     x_api_key: Optional[str] = Header(default=None),
     db: Session = Depends(get_db),
 ) -> User:
-    """
-    FastAPI dependency that authenticates a request via either a JWT bearer
-    token or a static service API key. Raises 401 if neither is valid.
-    """
-    # Service-to-service auth via API key bypasses per-user lookup.
-    if x_api_key and API_SERVICE_KEY and x_api_key == API_SERVICE_KEY:
-        # Return a lightweight pseudo-user for service calls.
+    """Authenticate via JWT Bearer token or constant-time X-API-Key header."""
+    configured_api_key = os.environ.get("API_SERVICE_KEY") or API_SERVICE_KEY
+    if x_api_key and configured_api_key and hmac.compare_digest(x_api_key, configured_api_key):
         return User(id=0, username="service-account", role="admin")
 
     if not token:
@@ -103,6 +112,9 @@ def get_current_user(
 
     payload = decode_access_token(token)
     username = payload.get("sub")
+    if not username:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token payload")
+
     user = db.query(User).filter(User.username == username).first()
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
@@ -115,40 +127,28 @@ def require_admin(user: User = Depends(get_current_user)) -> User:
     return user
 
 
-# --- Password reset / OTP helpers -------------------------------------
-# Shared by src/api/routes/auth.py. Kept here alongside the rest of the
-# auth primitives rather than duplicated in the routes module.
-
 def generate_secure_token(nbytes: int = 32) -> str:
-    """A cryptographically random, URL-safe token for password-reset links."""
+    """Cryptographically random URL-safe token for password-reset links."""
     return pysecrets.token_urlsafe(nbytes)
 
 
 def generate_otp_code() -> str:
-    """A random 6-digit numeric OTP code, zero-padded (e.g. '004821')."""
+    """Random 6-digit numeric OTP code, zero-padded."""
     return f"{pysecrets.randbelow(1_000_000):06d}"
 
 
 def hash_token(token: str) -> str:
-    """
-    SHA-256 hash for reset tokens / OTP codes before storing them.
-
-    Deliberately NOT bcrypt: bcrypt's slow, salted hashing exists to resist
-    brute-forcing a *low-entropy, user-chosen* password. A reset token is a
-    256-bit random value and an OTP is validated with its own expiry +
-    attempt-count limit (see OTP_MAX_ATTEMPTS) — a fast, unsalted SHA-256
-    lookup hash is the right tool here, the same way session/API tokens
-    are commonly hashed.
-    """
+    """SHA-256 lookup digest for high-entropy reset tokens and rate-limited OTPs."""
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def get_user_by_identifier(db: Session, identifier: str) -> Optional[User]:
-    """Look up a user by username OR email — used by /auth/login,
-    /auth/forgot-password, and /auth/otp/request so an analyst can use
-    whichever they remember."""
+    """Look up a user by exact username or case-insensitive email."""
+    cleaned = identifier.strip()
+    if not cleaned:
+        return None
     return (
         db.query(User)
-        .filter((User.username == identifier) | (User.email == identifier))
+        .filter((User.username == cleaned) | (func.lower(User.email) == cleaned.lower()))
         .first()
     )

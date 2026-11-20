@@ -1,16 +1,10 @@
+
 """
 Auth routes: registration, login (username OR email), forgot/reset
 password, and OTP login — all issuing the same JWT shape on success.
-
-Registration is intentionally simple for now (no email verification) —
-for production, gate POST /auth/register behind an existing admin account
-or an invite-code system rather than leaving it open. See the TODO below.
-
-Password reset and OTP codes are "sent" via src/utils/email_service.py,
-which defaults to a dev-mode console/log backend — see that module's
-docstring and docs/SETUP.md for switching to real SMTP.
 """
 
+import hmac
 import re
 from datetime import datetime, timedelta, timezone
 
@@ -18,38 +12,35 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session
 
-from src.db.database import get_db
-from src.db.models import User, UserRole, PasswordResetToken, OtpCode
 from src.api.auth import (
-    hash_password,
-    verify_password,
-    create_access_token,
-    generate_secure_token,
-    generate_otp_code,
-    hash_token,
-    get_user_by_identifier,
-    PASSWORD_RESET_TOKEN_EXPIRE_MINUTES,
     OTP_CODE_EXPIRE_MINUTES,
     OTP_MAX_ATTEMPTS,
+    PASSWORD_RESET_TOKEN_EXPIRE_MINUTES,
+    create_access_token,
+    generate_otp_code,
+    generate_secure_token,
+    get_user_by_identifier,
+    hash_password,
+    hash_token,
+    verify_password_constant_time,
 )
 from src.api.rate_limit import limiter
-from src.utils.email_service import send_email
+from src.db.database import get_db
+from src.db.models import OtpCode, PasswordResetToken, User, UserRole
 from src.utils.config import load_config
+from src.utils.email_service import send_email
+from src.utils.logger import audit_log
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
-# A deliberately simple, dependency-free email format check — good enough
-# to catch typos and obviously-malformed input without pulling in the
-# email-validator package for a single regex's worth of value.
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
-FRONTEND_BASE_URL = load_config().get("app", {}).get("frontend_base_url", "http://localhost:5173")
+
+def _frontend_base_url() -> str:
+    return load_config().get("app", {}).get("frontend_base_url", "http://localhost:5173")
 
 
 def _as_utc(dt: datetime) -> datetime:
-    """SQLite returns naive datetimes even though we store UTC ones; treat
-    naive values as UTC so comparisons against timezone-aware 'now' don't
-    raise TypeError. (Postgres returns aware datetimes and passes through.)"""
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
@@ -58,16 +49,25 @@ class RegisterRequest(BaseModel):
     email: str
     password: str = Field(min_length=8)
 
+    @field_validator("username")
+    @classmethod
+    def validate_username(cls, v: str) -> str:
+        cleaned = v.strip()
+        if not cleaned:
+            raise ValueError("Username cannot be blank")
+        return cleaned
+
     @field_validator("email")
     @classmethod
     def validate_email(cls, v: str) -> str:
-        if not _EMAIL_RE.match(v):
+        cleaned = v.strip().lower()
+        if not _EMAIL_RE.match(cleaned):
             raise ValueError("Invalid email address")
-        return v.lower()
+        return cleaned
 
 
 class LoginRequest(BaseModel):
-    identifier: str  # username OR email
+    identifier: str
     password: str
 
 
@@ -77,7 +77,7 @@ class TokenResponse(BaseModel):
 
 
 class ForgotPasswordRequest(BaseModel):
-    identifier: str  # username or email
+    identifier: str
 
 
 class ResetPasswordRequest(BaseModel):
@@ -97,8 +97,6 @@ class OtpVerifyRequest(BaseModel):
 @router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
 @limiter.limit("5/minute")
 def register(request: Request, req: RegisterRequest, db: Session = Depends(get_db)):
-    # TODO(production): gate this behind an admin invite/approval flow
-    # rather than open self-registration, given the sensitivity of case data.
     if db.query(User).filter(User.username == req.username).first():
         raise HTTPException(status_code=400, detail="Username already taken")
     if db.query(User).filter(User.email == req.email).first():
@@ -114,6 +112,7 @@ def register(request: Request, req: RegisterRequest, db: Session = Depends(get_d
     db.commit()
     db.refresh(user)
 
+    audit_log(action="user_registered", actor=user.username, details={"role": user.role.value})
     token = create_access_token(subject=user.username, role=user.role.value)
     return TokenResponse(access_token=token)
 
@@ -122,9 +121,11 @@ def register(request: Request, req: RegisterRequest, db: Session = Depends(get_d
 @limiter.limit("10/minute")
 def login(request: Request, req: LoginRequest, db: Session = Depends(get_db)):
     user = get_user_by_identifier(db, req.identifier)
-    if not user or not verify_password(req.password, user.hashed_password):
+    hashed = user.hashed_password if user else None
+    if not verify_password_constant_time(req.password, hashed) or not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
 
+    audit_log(action="user_login", actor=user.username, details={"method": "password"})
     token = create_access_token(subject=user.username, role=user.role.value)
     return TokenResponse(access_token=token)
 
@@ -132,12 +133,6 @@ def login(request: Request, req: LoginRequest, db: Session = Depends(get_db)):
 @router.post("/forgot-password")
 @limiter.limit("5/minute")
 def forgot_password(request: Request, req: ForgotPasswordRequest, db: Session = Depends(get_db)):
-    """
-    Always returns the same generic message whether or not the account
-    exists — this prevents an attacker from using this endpoint to enumerate
-    valid usernames/emails. The actual reset link only goes out (via
-    send_email, dev-mode logs it) when the account is real.
-    """
     generic_response = {
         "message": "If an account with that username or email exists, a password reset link has been sent."
     }
@@ -155,10 +150,10 @@ def forgot_password(request: Request, req: ForgotPasswordRequest, db: Session = 
     db.add(reset_token)
     db.commit()
 
-    reset_link = f"{FRONTEND_BASE_URL}/#/reset-password/{raw_token}"
+    reset_link = f"{_frontend_base_url()}/#/reset-password/{raw_token}"
     send_email(
         to=user.email,
-        subject="Password Reset — Dark Web Identity Correlation Toolkit",
+        subject="Password Reset — Corvus Identity Attribution",
         body=(
             f"Hi {user.username},\n\n"
             f"A password reset was requested for your account. This link expires in "
@@ -189,19 +184,25 @@ def reset_password(request: Request, req: ResetPasswordRequest, db: Session = De
     reset_token.used = True
     db.commit()
 
+    audit_log(action="password_reset_completed", actor=user.username, details={})
     return {"message": "Password has been reset. You can now log in with your new password."}
 
 
 @router.post("/otp/request")
 @limiter.limit("5/minute")
 def otp_request(request: Request, req: OtpRequestRequest, db: Session = Depends(get_db)):
-    """Same generic-response pattern as forgot-password, for the same
-    user-enumeration-prevention reason."""
-    generic_response = {"message": "If an account with that username or email exists, an OTP code has been sent."}
+    generic_response = {
+        "message": "If an account with that username or email exists, an OTP code has been sent."
+    }
 
     user = get_user_by_identifier(db, req.identifier)
     if not user or not user.email:
         return generic_response
+
+    # Invalidate any previously issued, unused OTP codes for this account
+    db.query(OtpCode).filter(OtpCode.user_id == user.id, OtpCode.used.is_(False)).update(
+        {"used": True}, synchronize_session=False
+    )
 
     raw_code = generate_otp_code()
     otp = OtpCode(
@@ -242,7 +243,7 @@ def otp_verify(request: Request, req: OtpVerifyRequest, db: Session = Depends(ge
     if otp.attempts >= OTP_MAX_ATTEMPTS:
         raise HTTPException(status_code=429, detail="Too many attempts — request a new code")
 
-    if hash_token(req.code) != otp.code_hash:
+    if not hmac.compare_digest(hash_token(req.code.strip()), otp.code_hash):
         otp.attempts += 1
         db.commit()
         raise HTTPException(status_code=400, detail="Invalid or expired code")
@@ -250,5 +251,6 @@ def otp_verify(request: Request, req: OtpVerifyRequest, db: Session = Depends(ge
     otp.used = True
     db.commit()
 
+    audit_log(action="user_login", actor=user.username, details={"method": "otp"})
     token = create_access_token(subject=user.username, role=user.role.value)
     return TokenResponse(access_token=token)
